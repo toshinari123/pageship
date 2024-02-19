@@ -1,7 +1,6 @@
 package site
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -11,7 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/oursky/pageship/internal/cache"
+	siteContext "github.com/oursky/pageship/internal/handler/site/context"
+	"github.com/oursky/pageship/internal/handler/site/middleware"
 	"github.com/oursky/pageship/internal/httputil"
 	"github.com/oursky/pageship/internal/site"
 )
@@ -20,24 +20,17 @@ type SiteHandler struct {
 	desc     *site.Descriptor
 	publicFS site.FS
 	next     http.Handler
-	cc       *cache.ContentCache
 }
 
-func NewSiteHandler(desc *site.Descriptor, middlewares []Middleware) *SiteHandler {
-	cc, err := cache.NewContentCache(1 << 24, false) //16 MiB
-	if err != nil {
-		cc = nil
-	}
-
+func NewSiteHandler(desc *site.Descriptor, middlewares []middleware.Middleware) *SiteHandler {
 	h := &SiteHandler{
 		desc:     desc,
 		publicFS: site.SubFS(desc.FS, path.Clean("/"+desc.Config.Public)),
-		cc:       cc,
 	}
 
 	publicDesc := *desc
 	publicDesc.FS = site.SubFS(desc.FS, path.Clean("/"+desc.Config.Public))
-	h.next = applyMiddleware(&publicDesc, middlewares, http.HandlerFunc(h.serveFile))
+	h.next = middleware.ApplyMiddleware(&publicDesc, middlewares, http.HandlerFunc(h.serveFile))
 	return h
 }
 
@@ -51,7 +44,7 @@ func (h *SiteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
-		r = r.WithContext(withSiteContext(r.Context()))
+		r = r.WithContext(siteContext.WithSiteContext(r.Context()))
 
 		if !strings.HasPrefix(r.URL.Path, "/") {
 			r.URL.Path = "/" + r.URL.Path
@@ -85,23 +78,13 @@ func (h *SiteHandler) serveFile(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "public, max-age=31536000, no-cache")
 	}
 
-	lReader := &lazyReader{
+	reader := &lazyReader{
 		fs:   h.publicFS,
 		path: r.URL.Path,
 		ctx:  r.Context(),
 	}
-	defer lReader.Close()
-	var reader = io.ReadSeeker(lReader)
+	defer reader.Close()
 
-	if info.Hash != "" {
-		cell, err := h.cc.GetContent(info.Hash, reader)
-		if err != nil {
-			http.Error(w, "internal server error", http.StatusInternalServerError)
-			return
-		} else {
-			reader = bytes.NewReader(cell.Data.Bytes())
-		}
-	}
 	writer := httputil.NewTimeoutResponseWriter(w, 10*time.Second)
 	http.ServeContent(writer, r, path.Base(r.URL.Path), info.ModTime, reader)
 }
